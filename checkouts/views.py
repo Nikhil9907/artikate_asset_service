@@ -181,11 +181,17 @@ class EmployeeSummaryView(APIView):
             lifetime_checkout_count=Count("id"),
             count_currently_held=Count("id", filter=Q(returned_at__isnull=True)),
             count_currently_overdue=Count("id", filter=Q(returned_at__isnull=True, due_at__lt=now)),
-            mean_hold_duration=Avg(hold_duration_expr, filter=Q(It looks like your code snippet got cut off right at the end of `EmployeeSummaryView` around `agg["count_`.
+            mean_hold_duration=Avg(hold_duration_expr, filter=Q(returned_at__isnull=False)),
+        )
 
-Here is the completed response dictionary and the rest of `EmployeeSummaryView` to finish the file:
+        mean_duration = agg["mean_hold_duration"]
+        mean_hold_days = 0.0
+        if mean_duration is not None:
+            if isinstance(mean_duration, timedelta):
+                mean_hold_days = round(mean_duration.total_seconds() / 86400.0, 2)
+            else:
+                mean_hold_days = round(float(mean_duration) / 86400.0, 2)
 
-```python
         return Response(
             {
                 "employee_code": employee.employee_code,
@@ -196,3 +202,38 @@ Here is the completed response dictionary and the rest of `EmployeeSummaryView` 
             },
             status=status.HTTP_200_OK,
         )
+
+
+class OverdueReportView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    pagination_class = StandardResultsSetPagination
+
+    def list(self, request, *args, **kwargs):
+        now = timezone.now()
+        qs = (
+            CheckOut.objects.filter(returned_at__isnull=True, due_at__lt=now)
+            .select_related("asset", "employee")
+            .order_by("due_at")
+        )
+
+        page = self.paginate_queryset(qs)
+        results = page if page is not None else qs
+
+        rows = []
+        for c in results:
+            delta = now - c.due_at
+            rows.append(
+                {
+                    "checkout_id": c.id,
+                    "asset_name": c.asset.name,
+                    "asset_tag": c.asset.asset_tag,
+                    "employee_code": c.employee.employee_code,
+                    "employee_name": c.employee.full_name,
+                    "due_at": c.due_at,
+                    "days_overdue": int(delta.total_seconds() // 86400),
+                }
+            )
+
+        if page is not None:
+            return self.get_paginated_response(rows)
+        return Response({"count": len(rows), "rows": rows}, status=status.HTTP_200_OK)
