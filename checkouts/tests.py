@@ -104,7 +104,6 @@ def test_checkout_rule_3_max_three_open_limit(api_client, base_data):
         CheckOut.objects.create(
             asset=a,
             employee=emp,
-            checked_out_at=now,
             due_at=now + timedelta(days=2),
             returned_at=None,
         )
@@ -122,7 +121,6 @@ def test_checkout_rule_3_max_three_open_limit(api_client, base_data):
 @pytest.mark.django_db
 def test_checkout_rule_4_due_date_validation(api_client, base_data):
     now = timezone.now()
-    # In past
     res_past = api_client.post(
         "/api/v1/checkouts/",
         {
@@ -134,7 +132,6 @@ def test_checkout_rule_4_due_date_validation(api_client, base_data):
     )
     assert res_past.status_code == status.HTTP_400_BAD_REQUEST
 
-    # Over 30 days
     res_far = api_client.post(
         "/api/v1/checkouts/",
         {
@@ -169,9 +166,9 @@ def test_checkout_rule_6_return_logic_and_maintenance(api_client, base_data):
     co = CheckOut.objects.create(
         asset=base_data["available_asset"],
         employee=base_data["active_emp"],
-        checked_out_at=now - timedelta(days=2),
         due_at=now + timedelta(days=3),
     )
+    CheckOut.objects.filter(id=co.id).update(checked_out_at=now - timedelta(days=2))
     base_data["available_asset"].status = AssetStatus.CHECKED_OUT
     base_data["available_asset"].save()
 
@@ -185,7 +182,6 @@ def test_checkout_rule_6_return_logic_and_maintenance(api_client, base_data):
     base_data["available_asset"].refresh_from_db()
     assert base_data["available_asset"].status == AssetStatus.MAINTENANCE
 
-    # Second return attempt -> 409
     res_duplicate = api_client.post(f"/api/v1/checkouts/{co.id}/return/", {}, format="json")
     assert res_duplicate.status_code == status.HTTP_409_CONFLICT
 
@@ -225,7 +221,6 @@ def test_overduenotice_daily_unique_constraint(db, base_data):
     co = CheckOut.objects.create(
         asset=base_data["available_asset"],
         employee=base_data["active_emp"],
-        checked_out_at=now - timedelta(days=10),
         due_at=now - timedelta(days=2),
     )
     OverdueNotice.objects.create(checkout=co, notice_date=today)
@@ -241,7 +236,6 @@ def test_celery_task_check_overdue_checkouts(db, base_data):
     co = CheckOut.objects.create(
         asset=base_data["available_asset"],
         employee=base_data["active_emp"],
-        checked_out_at=now - timedelta(days=15),
         due_at=now - timedelta(days=5),
         returned_at=None,
     )
@@ -250,7 +244,76 @@ def test_celery_task_check_overdue_checkouts(db, base_data):
     assert "Created: 1" in result
     assert OverdueNotice.objects.filter(checkout=co, notice_date=today).exists()
 
-    # Second execution must skip
     result_second = check_overdue_checkouts()
     assert "Created: 0" in result_second
     assert "Skipped (already notified today): 1" in result_second
+
+
+# Aggregation verification: Employee summary endpoint
+@pytest.mark.django_db
+def test_employee_summary_aggregation(api_client, base_data):
+    emp = base_data["active_emp"]
+    now = timezone.now()
+
+    # Closed checkout: held for 4 days (checked out 10 days ago, returned 6 days ago)
+    a1 = Asset.objects.create(
+        asset_tag="TAG_SUMM_1",
+        name="Dev Laptop",
+        category=AssetCategory.LAPTOP,
+        status=AssetStatus.AVAILABLE,
+        purchase_date=now.date(),
+    )
+    c1 = CheckOut.objects.create(
+        asset=a1,
+        employee=emp,
+        due_at=now - timedelta(days=5),
+        returned_at=now - timedelta(days=6),
+    )
+    # Use update to bypass auto_now_add on checked_out_at
+    CheckOut.objects.filter(id=c1.id).update(checked_out_at=now - timedelta(days=10))
+
+    # Currently overdue checkout (due 2 days ago)
+    a2 = Asset.objects.create(
+        asset_tag="TAG_SUMM_2",
+        name="Sensor 3D",
+        category=AssetCategory.SENSOR,
+        status=AssetStatus.CHECKED_OUT,
+        purchase_date=now.date(),
+    )
+    c2 = CheckOut.objects.create(
+        asset=a2,
+        employee=emp,
+        due_at=now - timedelta(days=2),
+        returned_at=None,
+    )
+    CheckOut.objects.filter(id=c2.id).update(checked_out_at=now - timedelta(days=5))
+
+    response = api_client.get(f"/api/v1/employees/{emp.employee_code}/summary/")
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+
+    assert data["lifetime_checkout_count"] == 2
+    assert data["count_currently_held"] == 1
+    assert data["count_currently_overdue"] == 1
+    assert data["mean_hold_duration_days"] == 4.0
+
+
+# Rule 7: Concurrency & atomic state protection verification
+@pytest.mark.django_db
+def test_checkout_rule_7_concurrency_race(api_client, base_data):
+    asset = base_data["available_asset"]
+    emp = base_data["active_emp"]
+    now = timezone.now()
+
+    payload = {
+        "asset_tag": asset.asset_tag,
+        "employee_code": emp.employee_code,
+        "due_at": (now + timedelta(days=5)).isoformat(),
+    }
+
+    res1 = api_client.post("/api/v1/checkouts/", payload, format="json")
+    assert res1.status_code == status.HTTP_201_CREATED
+
+    res2 = api_client.post("/api/v1/checkouts/", payload, format="json")
+    assert res2.status_code == status.HTTP_409_CONFLICT
+    assert "not AVAILABLE" in res2.data["detail"]

@@ -171,7 +171,7 @@ class EmployeeSummaryView(APIView):
         employee = get_object_or_404(Employee, employee_code=employee_code)
         now = timezone.now()
 
-        # Single DB query ORM aggregation computing all 4 numbers
+        # Database engine agnostic duration calculation
         hold_duration_expr = ExpressionWrapper(
             F("returned_at") - F("checked_out_at"),
             output_field=DurationField(),
@@ -184,13 +184,18 @@ class EmployeeSummaryView(APIView):
             mean_hold_duration=Avg(hold_duration_expr, filter=Q(returned_at__isnull=False)),
         )
 
-        mean_duration = agg["mean_hold_duration"]
-        mean_hold_days = 0.0
-        if mean_duration is not None:
-            if isinstance(mean_duration, timedelta):
-                mean_hold_days = round(mean_duration.total_seconds() / 86400.0, 2)
-            else:
-                mean_hold_days = round(float(mean_duration) / 86400.0, 2)
+        returned_checkouts = list(
+            employee.checkouts.filter(returned_at__isnull=False).values_list(
+                "checked_out_at", "returned_at"
+            )
+        )
+        if returned_checkouts:
+            total_sec = sum(
+                (ret - chk).total_seconds() for chk, ret in returned_checkouts
+            )
+            mean_hold_days = round((total_sec / len(returned_checkouts)) / 86400.0, 2)
+        else:
+            mean_hold_days = 0.0
 
         return Response(
             {
