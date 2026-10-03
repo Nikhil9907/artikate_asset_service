@@ -8,3 +8,4 @@ db.sqlite3
 htmlcov/
 *.log
 .DS_Store
+celerybeat-schedule
